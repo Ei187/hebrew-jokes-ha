@@ -1,0 +1,26 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Hebrew Jokes",
+        "description": "Fetches random jokes from bdihot.co.il",
+        "data": {
+          "scan_interval": "Update interval (seconds)"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "Integration is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Hebrew Jokes Settings",
+        "data": {
+          "scan_interval": "Update interval (seconds)"
+        }
+      }
+    }
+  }
+}

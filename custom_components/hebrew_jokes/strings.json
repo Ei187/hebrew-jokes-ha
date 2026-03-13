@@ -1,0 +1,26 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Hebrew Jokes",
+        "description": "שולף בדיחות אקראיות מ-bdihot.co.il",
+        "data": {
+          "scan_interval": "תדירות עדכון (שניות)"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "האינטגרציה כבר מוגדרת"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "הגדרות Hebrew Jokes",
+        "data": {
+          "scan_interval": "תדירות עדכון (שניות)"
+        }
+      }
+    }
+  }
+}
