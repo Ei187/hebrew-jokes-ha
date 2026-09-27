@@ -71,16 +71,22 @@ class HebrewJokesCoordinator(DataUpdateCoordinator):
                             _LOGGER.warning(
                                 "bdihot.co.il החזיר סטטוס %s", resp.status
                             )
-                            return {"joke": self._last_joke}
+                            return {"joke": self._last_joke, "raw": {}}
 
                         data = await resp.json(content_type=None)
 
-        except aiohttp.ClientError as err:
+        except (aiohttp.ClientError, TimeoutError) as err:
+            _LOGGER.warning("שגיאת רשת בעדכון בדיחה, משתמש בבדיחה האחרונה: %s", err)
+            if self._last_joke:
+                return {"joke": self._last_joke, "raw": {}}
             raise UpdateFailed(f"שגיאת רשת: {err}") from err
         except Exception as err:
+            _LOGGER.warning("שגיאה בעדכון בדיחה, משתמש בבדיחה האחרונה: %s", err)
+            if self._last_joke:
+                return {"joke": self._last_joke, "raw": {}}
             raise UpdateFailed(f"שגיאה: {err}") from err
 
-        # אותו לוגיקה כמו ה-value_template המקורי
+        # אותה לוגיקה כמו ה-value_template המקורי
         try:
             content = data.get("joke", {}).get("content", "")
             content = content.replace("\r", "").replace("\n", " ").strip()
@@ -89,6 +95,8 @@ class HebrewJokesCoordinator(DataUpdateCoordinator):
 
         if content and content.lower() != "none":
             self._last_joke = content
+        elif not self._last_joke:
+            _LOGGER.warning("לא התקבלה בדיחה ואין בדיחה קודמת לשמר")
 
         return {
             "joke": self._last_joke,
