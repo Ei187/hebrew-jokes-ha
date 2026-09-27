@@ -1,7 +1,9 @@
 """אינטגרציה Hebrew Jokes ל-Home Assistant."""
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections import deque
 from datetime import timedelta
 
 import aiohttp
@@ -10,13 +12,20 @@ import async_timeout
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import DOMAIN, DEFAULT_SCAN_INTERVAL, CONF_SCAN_INTERVAL, API_URL
 
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
+
+# כמה בדיחות תקינות אחרונות לשמור כרשת ביטחון
+_HISTORY_SIZE = 5
+
+# כל עוד מעולם לא התקבלה בדיחה תקינה: כמה ניסיונות ובאיזה מרווח, לפני שמוותרים למחזור הזה
+_FIRST_JOKE_MAX_RETRIES = 10
+_FIRST_JOKE_RETRY_DELAY = 3  # שניות
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -49,7 +58,7 @@ async def _async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None
 
 
 class HebrewJokesCoordinator(DataUpdateCoordinator):
-    """Coordinator that fetches jokes from bdihot.co.il."""
+    """Coordinator that fetches jokes from bdihot.co.il — never surfaces as unavailable."""
 
     def __init__(self, hass: HomeAssistant, scan_interval: int) -> None:
         """Initialize."""
@@ -59,10 +68,11 @@ class HebrewJokesCoordinator(DataUpdateCoordinator):
             name=DOMAIN,
             update_interval=timedelta(seconds=scan_interval),
         )
-        self._last_joke: str = ""
+        # רשימת הבדיחות התקינות האחרונות - האחרונה שבפנים היא הכי חדשה
+        self._joke_history: deque[str] = deque(maxlen=_HISTORY_SIZE)
 
-    async def _async_update_data(self) -> dict:
-        """Fetch joke from bdihot.co.il."""
+    async def _fetch_once(self) -> tuple[str, dict]:
+        """ניסיון בודד להביא בדיחה. לעולם לא זורק - מחזיר ("", {}) בכישלון."""
         try:
             async with async_timeout.timeout(10):
                 async with aiohttp.ClientSession() as session:
@@ -71,22 +81,15 @@ class HebrewJokesCoordinator(DataUpdateCoordinator):
                             _LOGGER.warning(
                                 "bdihot.co.il החזיר סטטוס %s", resp.status
                             )
-                            return {"joke": self._last_joke, "raw": {}}
-
+                            return "", {}
                         data = await resp.json(content_type=None)
-
         except (aiohttp.ClientError, TimeoutError) as err:
-            _LOGGER.warning("שגיאת רשת בעדכון בדיחה, משתמש בבדיחה האחרונה: %s", err)
-            if self._last_joke:
-                return {"joke": self._last_joke, "raw": {}}
-            raise UpdateFailed(f"שגיאת רשת: {err}") from err
-        except Exception as err:
-            _LOGGER.warning("שגיאה בעדכון בדיחה, משתמש בבדיחה האחרונה: %s", err)
-            if self._last_joke:
-                return {"joke": self._last_joke, "raw": {}}
-            raise UpdateFailed(f"שגיאה: {err}") from err
+            _LOGGER.warning("שגיאת רשת בשליפת בדיחה: %s", err)
+            return "", {}
+        except Exception as err:  # noqa: BLE001 - בכוונה, לא רוצים נפילה
+            _LOGGER.warning("שגיאה בשליפת בדיחה: %s", err)
+            return "", {}
 
-        # אותה לוגיקה כמו ה-value_template המקורי
         try:
             content = data.get("joke", {}).get("content", "")
             content = content.replace("\r", "").replace("\n", " ").strip()
@@ -94,11 +97,29 @@ class HebrewJokesCoordinator(DataUpdateCoordinator):
             content = ""
 
         if content and content.lower() != "none":
-            self._last_joke = content
-        elif not self._last_joke:
-            _LOGGER.warning("לא התקבלה בדיחה ואין בדיחה קודמת לשמר")
+            return content, data
+        return "", data
 
-        return {
-            "joke": self._last_joke,
-            "raw": data,
-        }
+    async def _async_update_data(self) -> dict:
+        """Fetch joke. If a good joke was never received yet, keep retrying quietly
+        (without publishing anything) until one arrives or we run out of attempts
+        for this cycle — the next scheduled cycle will try again."""
+        have_history = bool(self._joke_history)
+        attempts = 1 if have_history else _FIRST_JOKE_MAX_RETRIES
+        last_raw: dict = {}
+
+        for attempt in range(attempts):
+            content, raw = await self._fetch_once()
+            last_raw = raw
+            if content:
+                self._joke_history.append(content)
+                return {"joke": content, "raw": raw}
+            if attempt < attempts - 1:
+                await asyncio.sleep(_FIRST_JOKE_RETRY_DELAY)
+
+        # הניסיון/ים הזה נכשלו
+        if self._joke_history:
+            # יש היסטוריה - מציגים את הבדיחה התקינה האחרונה
+            return {"joke": self._joke_history[-1], "raw": last_raw}
+        # אין שום בדיחה תקינה עדיין - לא מציגים כלום, ומחכים למחזור הבא
+        return {"joke": None, "raw": last_raw}
