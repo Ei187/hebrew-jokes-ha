@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections import deque
 from datetime import timedelta
 
 import aiohttp
@@ -20,12 +19,13 @@ _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 
-# כמה בדיחות תקינות אחרונות לשמור כרשת ביטחון
-_HISTORY_SIZE = 5
+# ברוב הזמן: מחכים כל כך הרבה שניות בין ניסיון לניסיון כשבדיחה יוצאת לא תקינה
+_RETRY_DELAY = 10  # שניות
 
-# כל עוד מעולם לא התקבלה בדיחה תקינה: כמה ניסיונות ובאיזה מרווח, לפני שמוותרים למחזור הזה
-_FIRST_JOKE_MAX_RETRIES = 10
-_FIRST_JOKE_RETRY_DELAY = 3  # שניות
+# רק בהפעלה הראשונה אי פעם (לפני שהתקבלה ולו בדיחה תקינה אחת): הגבלה כדי שטעינת
+# האינטגרציה לא תיתקע ל-Home Assistant אם ה-API תקוע לאורך זמן ארוך
+_FIRST_JOKE_MAX_RETRIES = 10  # ~30 שניות בסך הכל (10 * 3)
+_FIRST_JOKE_RETRY_DELAY = 3
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -58,7 +58,13 @@ async def _async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None
 
 
 class HebrewJokesCoordinator(DataUpdateCoordinator):
-    """Coordinator that fetches jokes from bdihot.co.il — never surfaces as unavailable."""
+    """Coordinator that fetches jokes from bdihot.co.il.
+
+    Never publishes an "unavailable"/"unknown" joke once one good joke has
+    ever been received: on a bad fetch it just keeps retrying every
+    _RETRY_DELAY seconds, in the same update cycle, until a good one arrives —
+    the entity simply keeps showing whatever it last showed in the meantime.
+    """
 
     def __init__(self, hass: HomeAssistant, scan_interval: int) -> None:
         """Initialize."""
@@ -68,8 +74,7 @@ class HebrewJokesCoordinator(DataUpdateCoordinator):
             name=DOMAIN,
             update_interval=timedelta(seconds=scan_interval),
         )
-        # רשימת הבדיחות התקינות האחרונות - האחרונה שבפנים היא הכי חדשה
-        self._joke_history: deque[str] = deque(maxlen=_HISTORY_SIZE)
+        self._ever_succeeded = False
 
     async def _fetch_once(self) -> tuple[str, dict]:
         """ניסיון בודד להביא בדיחה. לעולם לא זורק - מחזיר ("", {}) בכישלון."""
@@ -101,25 +106,27 @@ class HebrewJokesCoordinator(DataUpdateCoordinator):
         return "", data
 
     async def _async_update_data(self) -> dict:
-        """Fetch joke. If a good joke was never received yet, keep retrying quietly
-        (without publishing anything) until one arrives or we run out of attempts
-        for this cycle — the next scheduled cycle will try again."""
-        have_history = bool(self._joke_history)
-        attempts = 1 if have_history else _FIRST_JOKE_MAX_RETRIES
-        last_raw: dict = {}
+        """מנסה עד שמתקבלת בדיחה תקינה. לא מחזיר/מפרסם אף פעם בדיחה ריקה."""
+        if not self._ever_succeeded:
+            # ההפעלה הראשונה אי פעם - מנסים מספר קבוע של פעמים כדי לא לתקוע
+            # את טעינת האינטגרציה, ואם לא הצליח - ממשיכים בלי לחסום, הסבב
+            # הבא (בעוד scan_interval שניות) ימשיך לנסות ללא הגבלה
+            for attempt in range(_FIRST_JOKE_MAX_RETRIES):
+                content, raw = await self._fetch_once()
+                if content:
+                    self._ever_succeeded = True
+                    return {"joke": content, "raw": raw}
+                if attempt < _FIRST_JOKE_MAX_RETRIES - 1:
+                    await asyncio.sleep(_FIRST_JOKE_RETRY_DELAY)
+            return {"joke": None, "raw": {}}
 
-        for attempt in range(attempts):
+        # כבר הייתה הצלחה בעבר - מנסים בלי הגבלה, כל _RETRY_DELAY שניות,
+        # עד שמתקבלת בדיחה תקינה (הישות פשוט נשארת עם הערך הקודם בינתיים)
+        while True:
             content, raw = await self._fetch_once()
-            last_raw = raw
             if content:
-                self._joke_history.append(content)
                 return {"joke": content, "raw": raw}
-            if attempt < attempts - 1:
-                await asyncio.sleep(_FIRST_JOKE_RETRY_DELAY)
-
-        # הניסיון/ים הזה נכשלו
-        if self._joke_history:
-            # יש היסטוריה - מציגים את הבדיחה התקינה האחרונה
-            return {"joke": self._joke_history[-1], "raw": last_raw}
-        # אין שום בדיחה תקינה עדיין - לא מציגים כלום, ומחכים למחזור הבא
-        return {"joke": None, "raw": last_raw}
+            _LOGGER.warning(
+                "בדיחה לא תקינה/ריקה, מנסה שוב בעוד %s שניות", _RETRY_DELAY
+            )
+            await asyncio.sleep(_RETRY_DELAY)
