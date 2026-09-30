@@ -1,97 +1,137 @@
-"""סנסור Hebrew Jokes."""
+"""אינטגרציה Hebrew Jokes ל-Home Assistant."""
 from __future__ import annotations
 
-from homeassistant.components.sensor import SensorEntity
+import html
+import logging
+import re
+from datetime import timedelta
+
+import aiohttp
+import async_timeout
+
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
+from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.restore_state import RestoreEntity
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from . import HebrewJokesCoordinator
-from .const import DOMAIN
+from .const import DOMAIN, DEFAULT_SCAN_INTERVAL, CONF_SCAN_INTERVAL, API_URL
 
-# המגבלה של Home Assistant לאורך state
-MAX_STATE_LENGTH = 255
+_LOGGER = logging.getLogger(__name__)
 
+PLATFORMS: list[Platform] = [Platform.SENSOR]
 
-async def async_setup_entry(
-    hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
-) -> None:
-    """Set up the sensor."""
-    coordinator: HebrewJokesCoordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([HebrewJokesSensor(coordinator, entry)], True)
+# כשהבדיחה לא תקינה: מנסים שוב כל כך הרבה שניות, עד שמתקבלת תקינה
+_RETRY_DELAY = 10
+
+_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; HomeAssistant HebrewJokes)",
+    "Accept": "application/json, text/plain, */*",
+}
+
+_TAG_RE = re.compile(r"<[^>]+>")
 
 
-class HebrewJokesSensor(CoordinatorEntity, SensorEntity, RestoreEntity):
-    """סנסור שמציג בדיחה בעברית."""
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up Hebrew Jokes from a config entry."""
+    scan_interval = entry.options.get(
+        CONF_SCAN_INTERVAL,
+        entry.data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
+    )
 
-    _attr_has_entity_name = True
-    _attr_name = None
-    _attr_icon = "mdi:emoticon-happy-outline"
+    coordinator = HebrewJokesCoordinator(hass, scan_interval)
+    await coordinator.async_config_entry_first_refresh()
 
-    def __init__(self, coordinator: HebrewJokesCoordinator, entry: ConfigEntry) -> None:
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    entry.async_on_unload(entry.add_update_listener(_async_update_options))
+
+    return True
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload a config entry."""
+    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        hass.data[DOMAIN].pop(entry.entry_id)
+    return unload_ok
+
+
+async def _async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reload on options update."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
+class HebrewJokesCoordinator(DataUpdateCoordinator):
+    """Coordinator that fetches jokes from bdihot.co.il.
+
+    On a bad/empty joke it keeps the previous value (never unavailable) and
+    retries every _RETRY_DELAY seconds until a good joke arrives, then returns
+    to the normal scan interval.
+    """
+
+    def __init__(self, hass: HomeAssistant, scan_interval: int) -> None:
         """Initialize."""
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{entry.entry_id}_joke"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, entry.entry_id)},
-            "name": "Hebrew Jokes",
-            "manufacturer": "bdihot.co.il",
-            "model": "REST Sensor",
-        }
-        self._restored_joke: str | None = None
+        self._normal_interval = timedelta(seconds=scan_interval)
+        self._retry_interval = timedelta(seconds=_RETRY_DELAY)
+        super().__init__(
+            hass,
+            _LOGGER,
+            name=DOMAIN,
+            update_interval=self._normal_interval,
+        )
 
-    async def async_added_to_hass(self) -> None:
-        """שחזור הבדיחה האחרונה אחרי ריסטארט."""
-        await super().async_added_to_hass()
-        last_state = await self.async_get_last_state()
-        if last_state is None:
-            return
-        # מעדיפים את הבדיחה המלאה מהמאפיין, ואם אין - את ה-state
-        restored = last_state.attributes.get("joke") or last_state.state
-        if restored and restored not in (STATE_UNKNOWN, STATE_UNAVAILABLE):
-            self._restored_joke = restored
+    @staticmethod
+    def _clean_content(raw_content: str) -> str:
+        """מסיר תגי HTML (כמו <p></p>) ומפענח ישויות HTML, ומחזיר טקסט נקי בשורה אחת."""
+        text = _TAG_RE.sub(" ", raw_content)  # מסיר <p>, </p> וכל תג אחר
+        text = html.unescape(text)  # &quot; &amp; וכו' -> " & וכו'
+        text = text.replace("\r", " ").replace("\n", " ")
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
 
-    def _current_joke(self) -> str | None:
-        """הבדיחה המלאה הנוכחית (מהקורדינטור, ואם אין - המשוחזרת)."""
-        if self.coordinator.data:
-            joke = self.coordinator.data.get("joke")
-            if joke:
-                return joke
-        return self._restored_joke
-
-    @property
-    def native_value(self) -> str | None:
-        """Return the joke, shortened to fit the 255-char state limit."""
-        joke = self._current_joke()
-        if not joke:
-            return None
-        if len(joke) <= MAX_STATE_LENGTH:
-            return joke
-        return joke[: MAX_STATE_LENGTH - 1].rstrip() + "…"
-
-    @property
-    def extra_state_attributes(self) -> dict:
-        """Return extra attributes, including the full joke text."""
-        attrs: dict = {}
-
-        joke = self._current_joke()
-        if joke:
-            attrs["joke"] = joke
-
-        data = self.coordinator.data or {}
-        raw = data.get("raw", {})
+    async def _fetch_once(self) -> tuple[str, dict]:
+        """ניסיון בודד להביא בדיחה. לעולם לא זורק - מחזיר ("", {}) בכישלון."""
         try:
-            joke_data = raw.get("joke", {})
-            if isinstance(joke_data, dict):
-                for key in ("id", "title", "category", "author"):
-                    val = joke_data.get(key)
-                    if val:
-                        attrs[key] = val
+            async with async_timeout.timeout(10):
+                async with aiohttp.ClientSession(headers=_HEADERS) as session:
+                    async with session.get(API_URL) as resp:
+                        if resp.status != 200:
+                            _LOGGER.warning(
+                                "bdihot.co.il החזיר סטטוס %s", resp.status
+                            )
+                            return "", {}
+                        data = await resp.json(content_type=None)
+        except (aiohttp.ClientError, TimeoutError) as err:
+            _LOGGER.warning("שגיאת רשת בשליפת בדיחה: %s", err)
+            return "", {}
+        except Exception as err:  # noqa: BLE001 - בכוונה, לא רוצים נפילה
+            _LOGGER.warning("שגיאה בשליפת בדיחה: %s", err)
+            return "", {}
+
+        try:
+            raw_content = data.get("joke", {}).get("content", "")
         except (AttributeError, TypeError):
-            pass
-        return attrs
+            _LOGGER.warning("מבנה תשובה לא צפוי מה-API: %s", str(data)[:200])
+            raw_content = ""
+
+        content = self._clean_content(raw_content)
+
+        if content and content.lower() not in ("none", "unknown", "unavailable"):
+            return content, data
+
+        _LOGGER.warning("התקבל תוכן ריק/לא תקין מה-API: %s", str(data)[:200])
+        return "", data
+
+    async def _async_update_data(self) -> dict:
+        """Fetch a joke; on failure keep the previous one and retry soon."""
+        content, raw = await self._fetch_once()
+
+        if content:
+            # הצלחה - חוזרים לקצב הרגיל
+            self.update_interval = self._normal_interval
+            return {"joke": content, "raw": raw}
+
+        # כישלון - מנסים שוב בקרוב, ובינתיים משאירים את הבדיחה הקודמת
+        self.update_interval = self._retry_interval
+        if self.data:
+            return self.data
+        return {"joke": None, "raw": {}}
