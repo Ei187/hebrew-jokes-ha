@@ -20,7 +20,6 @@ _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 
-# כשהבדיחה לא תקינה: מנסים שוב כל כך הרבה שניות, עד שמתקבלת תקינה
 _RETRY_DELAY = 10
 
 _HEADERS = {
@@ -61,12 +60,7 @@ async def _async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None
 
 
 class HebrewJokesCoordinator(DataUpdateCoordinator):
-    """Coordinator that fetches jokes from bdihot.co.il.
-
-    On a bad/empty joke it keeps the previous value (never unavailable) and
-    retries every _RETRY_DELAY seconds until a good joke arrives, then returns
-    to the normal scan interval.
-    """
+    """Coordinator that fetches jokes from bdihot.co.il."""
 
     def __init__(self, hass: HomeAssistant, scan_interval: int) -> None:
         """Initialize."""
@@ -81,9 +75,9 @@ class HebrewJokesCoordinator(DataUpdateCoordinator):
 
     @staticmethod
     def _clean_content(raw_content: str) -> str:
-        """מסיר תגי HTML (כמו <p></p>) ומפענח ישויות HTML, ומחזיר טקסט נקי בשורה אחת."""
-        text = _TAG_RE.sub(" ", raw_content)  # מסיר <p>, </p> וכל תג אחר
-        text = html.unescape(text)  # &quot; &amp; וכו' -> " & וכו'
+        """מסיר תגי HTML ומפענח ישויות HTML, מחזיר טקסט נקי בשורה אחת."""
+        text = _TAG_RE.sub(" ", raw_content)
+        text = html.unescape(text)
         text = text.replace("\r", " ").replace("\n", " ")
         text = re.sub(r"\s+", " ", text).strip()
         return text
@@ -107,8 +101,10 @@ class HebrewJokesCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("שגיאה בשליפת בדיחה: %s", err)
             return "", {}
 
+        # מטפל גם ב-content שהוא null במפורש, לא רק שדה חסר,
+        # וגם ב-data/joke שאינם dict כלל (מערך, מחרוזת, None)
         try:
-            raw_content = data.get("joke", {}).get("content", "")
+            raw_content = data.get("joke", {}).get("content") or ""
         except (AttributeError, TypeError):
             _LOGGER.warning("מבנה תשובה לא צפוי מה-API: %s", str(data)[:200])
             raw_content = ""
@@ -126,11 +122,9 @@ class HebrewJokesCoordinator(DataUpdateCoordinator):
         content, raw = await self._fetch_once()
 
         if content:
-            # הצלחה - חוזרים לקצב הרגיל
             self.update_interval = self._normal_interval
             return {"joke": content, "raw": raw}
 
-        # כישלון - מנסים שוב בקרוב, ובינתיים משאירים את הבדיחה הקודמת
         self.update_interval = self._retry_interval
         if self.data:
             return self.data
